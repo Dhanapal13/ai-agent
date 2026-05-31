@@ -58,7 +58,7 @@ async def health():
 
 @app.post("/webhook/github")
 async def github_webhook(request: Request, bg_tasks: BackgroundTasks):
-    raw_body = request.body()
+    raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
     if not verify_github_signature(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
@@ -112,7 +112,7 @@ if __name__ == "__main__":
     import uvicorn
     import os
     import dotenv
-    
+
     load_dotenv()
     print("🚀 Starting ngrok tunnel...")
 
