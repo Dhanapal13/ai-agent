@@ -58,8 +58,6 @@ def fetch_pr_details(repo: str, pr_number: int) -> dict:
         "title": pr_data.get("title"),
         "number": pr_data.get("number"),
         "state": pr_data.get("state"),
-        "author": pr_data.get("user", {}).get("login"),
-        "author_url": pr_data.get("user", {}).get("html_url"),
         "pr_url": pr_data.get("html_url"),
         "base_branch": pr_data.get("base", {}).get("ref"),      # target branch
         "head_branch": pr_data.get("head", {}).get("ref"),      # source branch
@@ -70,10 +68,6 @@ def fetch_pr_details(repo: str, pr_number: int) -> dict:
         "deletions": pr_data.get("deletions", 0),
         "changed_files": pr_data.get("changed_files", 0),
         "files": file_summaries,
-        "review_count": review_count,
-        "draft": pr_data.get("draft", False),
-        "mergeable": pr_data.get("mergeable"),
-        "labels": [l["name"] for l in pr_data.get("labels", [])],
     }
  
     return json.dumps(summary, indent=2)

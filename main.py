@@ -7,23 +7,40 @@ import hashlib
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
+import logging
+from datetime import datetime
 
+from fastapi.sse import EventSourceResponse
 from langchain.agents import create_agent
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from agent import process_pr_with_agent, create_pr_agent
+from agent import process_pr_with_agent, stream_pr_with_agent, visualise_graph
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s")
+
+logger = logging.getLogger(__name__)
+
+TRIGGER_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
 
 # App Setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("🔧 Starting PR Agent...")
+    visualise_graph()    
     yield
+    logger.info("🛑 Shutting down PR Agent...")
 
-app = FastAPI(title="Github PR Agent", lifespan=lifespan)
+
+app = FastAPI(title="Github PR Agent",
+              description="A FastAPI server that listens for GitHub PR events and processes them with a Langgraph agent.",
+              lifespan=lifespan)
 
 processing_prs = set()  # to track processed PRs and avoid duplicates
 
@@ -51,60 +68,163 @@ def verify_github_signature(payload_body: bytes, signature_header: Optional[str]
     return hmac.compare_digest(expected, received)
 
 
+def extract_pr_data(payload: dict):
+    try:
+        action = payload.get("action")
+        pr = payload.get("pull_request", {})
+        repo = payload.get("repository", {}).get("full_name", "unknown/repo")
+        pr_number = pr.get("number", "unknown")
+        pr_url = pr.get("html_url", "unknown_url")
+        logger.info(f"📥 Received PR event: action={action}, repo={repo}, pr_number={pr_number}, pr_url={pr_url}")
+
+        if not all([action, pr_url, repo, pr_number]):
+            return None  # missing critical info, skip processing
+        return repo, pr_number, pr_url, action
+    except Exception as e:
+        logger.error(f"❌ Error extracting PR data: {e}")
+        return None
+        
 # Routes
+
+@app.get("/")
+async def root():
+    return {
+        "service": "GitHub PR Agent",
+        "powered_by": "Langgraph + FastAPI + Ollama",
+        "message": "Welcome to the GitHub PR Agent! Send PR events to /webhook/github to trigger processing.",
+        "endpoints": {
+            "/health": "GET - Check if the agent is running",
+            "/webhook/github": "POST - GitHub webhook endpoint for PR events",
+            "/webhook/github/stream": "POST - GitHub webhook endpoint for PR events with streaming response (experimental)"
+        
+        }
+    }
+
 @app.get("/health")
 async def health():
-    return "Agent Running"
+    return {"message": "Agent Running", "timestamp": datetime.now().isoformat()}
 
 @app.post("/webhook/github")
 async def github_webhook(request: Request, bg_tasks: BackgroundTasks):
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
+    event_type = request.headers.get("X-GitHub-Event")
+
     if not verify_github_signature(raw_body, signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        logger.warning("⚠️  Invalid signature for incoming webhook")
+        raise HTTPException(status_code=401, detail="Invalid signature")
     
-    event_type= request.headers.get("X-Github-Event", "")
-    delivery_id = request.headers.get("X-Github-Delivery", "unknown")
-
     if event_type != "pull_request":
-        return JSONResponse(status_code=200, content={"message": "Event not handled"})
+        logger.info(f"📩 Ignoring non-PR event: {event_type}")
+        return JSONResponse(content={"message": f"Ignored event type: {event_type}"}, status_code=200)
 
-    # parse payload
-    payload = await request.json()
-    payload_action = payload.get("action")
-    if payload_action not in ["opened", "ready_for_review", "reopened"]:
-        return JSONResponse(status_code=200, content=
-                            {"message": f"PR action '{payload_action}' ignored, only 'opened', 'ready_for_review', 'reopened' are processed    "})
-
-    # extract PR details
-    pr = payload.get("pull_request", {})
-    pr_number = pr.get("number")
-    pr_url = pr.get("html_url")
-    repo_name = payload.get("repository", {}).get("full_name")
-    pr_title = pr.get("title")
-    author = pr.get("user", {}).get("login")
-
-    #  avoid duplicate processing
-    pr_key = f"{repo_name}#{pr_number}"
-    if pr_key in processing_prs:
-        print(f"Skipping duplicate PR event: {event_type} for PR #{pr_key} in {repo_name} by {author}")
-        return JSONResponse(status_code=200, content={"message": "Duplicate PR event ignored"})
-    print(f"Received PR event: {event_type} for PR #{pr_number} in {repo_name} by {author}")
-
-
-async def process_pr_in_background(pr_url, repo_name, pr_number, pr_key):
-    processing_prs.add(pr_key)
     try:
-        # process PR with async agent
-        loop = asyncio.get_event_loop()
-        agent = create_pr_agent()
-        result = await loop.run_in_executor(None, lambda: process_pr_with_agent(agent, pr_url, repo_name, pr_number))   
-        if result["status"] == "success":
-            print(f"✅ Successfully processed PR #{pr_key} in {repo_name}")
-        else:
-            print(f"❌ Failed to process PR #{pr_key} in {repo_name}: {result.get('error', 'Unknown error')}")
-    finally:
-        processing_prs.discard(pr_key)
+        payload = await request.json()        
+    except Exception as e:
+        logger.error(f"❌ Error parsing webhook payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    
+    pr_data = extract_pr_data(payload)
+
+    if not pr_data:
+        logger.warning("⚠️  Missing critical PR data, skipping processing")
+        return JSONResponse(content={"message": "Missing critical PR data, skipping"}, status_code=200)
+    
+    repo_name, pr_number, pr_url, action = pr_data
+
+    if action not in TRIGGER_ACTIONS:
+        logger.info(f"📩 Ignoring PR event with action: {action}")
+        return JSONResponse(content={"message": f"Ignored action: {action}"}, status_code=200)
+
+    logger.info(f"🚀 Triggering PR processing for {repo_name}#{pr_number} (action: {action})")
+
+    bg_tasks.add_task(process_pr_in_background, repo_name, pr_number, pr_url)
+
+
+# SSE webhook endpoint (experimental)
+@app.post("/webhook/github/stream")
+async def github_webhook_stream(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+    event_type = request.headers.get("X-GitHub-Event")
+
+    if not verify_github_signature(raw_body, signature):
+        logger.warning("⚠️  Invalid signature for incoming webhook")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    if event_type != "pull_request":
+        logger.info(f"📩 Ignoring non-PR event: {event_type}")
+        return JSONResponse(content={"message": f"Ignored event type: {event_type}"}, status_code=200)
+
+    try:
+        payload = await request.json()        
+    except Exception as e:
+        logger.error(f"❌ Error parsing webhook payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    
+    pr_data = extract_pr_data(payload)
+
+    if not pr_data:
+        logger.warning("⚠️  Missing critical PR data, skipping processing")
+        return JSONResponse(content={"message": "Missing critical PR data, skipping"}, status_code=200)
+    
+    repo_name, pr_number, pr_url, action = pr_data
+
+    if action not in TRIGGER_ACTIONS:
+        logger.info(f"📩 Ignoring PR event with action: {action}")
+        return JSONResponse(content={"message": f"Ignored action: {action}"}, status_code=200)
+
+    logger.info(f"🚀 Triggering PR processing for {repo_name}#{pr_number} (action: {action})")
+
+    # SSE streaming response
+    def sse_event(data: str):
+        return f"data: {data}\n\n"
+    
+    def event_generator():
+        final_result = None
+        try:
+            for node_name, output in stream_pr_with_agent(repo_name, pr_number, pr_url):
+                messages = output.get("messages", [])
+                if not messages:
+                    continue
+
+                last_message = messages[-1]
+                content  = getattr(last_message, "content", "") or ""
+
+                if not content:
+                    continue
+
+                final_result = content  # capture final output for summary
+
+                display = content if len(content) < 1000 else content[:1000] + "..."  # truncate long outputs
+
+                yield sse_event({
+                    "event": "node",
+                    "node": node_name,
+                    "output": display,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            yield sse_event({
+                "event": "complete",
+                "summary": final_result[:2000] + "..." if final_result and len(final_result) > 1000 else final_result,
+                "timestamp": datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.error(f"❌ Error during agent processing: {e}")
+
+    return EventSourceResponse(event_generator(), media_type="text/event-stream",
+                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "connection": "keep-alive"})
+            
+
+async def process_pr_in_background(repo_name: str, pr_number: int, pr_url: str) -> None:
+    result = await process_pr_with_agent(repo_name, pr_number, pr_url)
+    logger.info(f"✅ Finished processing PR {repo_name}#{pr_number}: {result}")
+    if result.get("success"):
+        logger.info(f"🎉 PR {repo_name}#{pr_number} processed successfully!")
+    else:
+        logger.error(f"❌ PR {repo_name}#{pr_number} processing failed: {result.get('error')}")
+
 
 
 if __name__ == "__main__":
