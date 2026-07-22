@@ -1,0 +1,50 @@
+# Self-hosted observability stack for the PR multi-agent system.
+#
+# This brings up Prometheus (scrapes /metrics from main.py) and Grafana
+# (dashboards on top of Prometheus). Run alongside your app:
+#
+#   docker compose -f docker-compose.observability.yml up -d
+#
+# Then:
+#   - Prometheus UI:  http://localhost:9090
+#   - Grafana UI:      http://localhost:3001  (default admin/admin)
+#
+# For traces (per-PR, per-agent LLM call visibility), self-host Langfuse
+# separately using their official compose file — it's a multi-service stack
+# (Postgres, ClickHouse, Redis, MinIO, langfuse-web, langfuse-worker) that's
+# best kept up to date from the source rather than pinned here:
+#
+#   git clone https://github.com/langfuse/langfuse
+#   cd langfuse && docker compose up -d
+#
+# Once it's running, set in your .env:
+#   LANGFUSE_HOST=http://localhost:3000
+#   LANGFUSE_PUBLIC_KEY=pk-lf-...
+#   LANGFUSE_SECRET_KEY=sk-lf-...
+# (create these keys in the Langfuse UI after first login)
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pr-agent-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    # host.docker.internal lets Prometheus (in a container) reach main_agent.py
+    # running on the host at :8000. On Linux you may instead need to set
+    # your host's actual IP, or run main.py in this same compose network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pr-agent-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus

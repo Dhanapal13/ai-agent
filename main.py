@@ -33,7 +33,6 @@ TRIGGER_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🔧 Starting PR Agent...")
-    visualise_graph()    
     yield
     logger.info("🛑 Shutting down PR Agent...")
 
@@ -140,6 +139,7 @@ async def github_webhook(request: Request, bg_tasks: BackgroundTasks):
     logger.info(f"🚀 Triggering PR processing for {repo_name}#{pr_number} (action: {action})")
 
     bg_tasks.add_task(process_pr_in_background, repo_name, pr_number, pr_url)
+    
 
 
 # SSE webhook endpoint (experimental)

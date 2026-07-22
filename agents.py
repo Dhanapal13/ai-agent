@@ -17,10 +17,18 @@ import json
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_ollama import ChatOllama
 
 from state import PRAgentState
 from tools import fetch_pr_details, run_risk_heuristic, send_email
+from observability import (
+    log,
+    observe_agent,
+    record_llm_call,
+    record_risk_level,
+    record_email_result,
+)
 
 load_dotenv()
 
@@ -48,31 +56,37 @@ size of the change (files/additions/deletions). Do not invent information
 that is not present in the JSON."""
 
 
-def fetch_agent(state: PRAgentState) -> dict:
+def fetch_agent(state: PRAgentState, config: RunnableConfig) -> dict:
     """Agent 1: calls GitHub, then asks the LLM to summarize the PR."""
     repo = state["repo"]
     pr_number = state["pr_number"]
 
-    result = fetch_pr_details(repo, pr_number)
+    with observe_agent("fetch_agent", repo=repo, pr_number=pr_number):
+        result = fetch_pr_details(repo, pr_number)
 
-    if "error" in result:
+        if "error" in result:
+            log.warning("github_fetch_failed", repo=repo, pr_number=pr_number, error=result["error"])
+            return {
+                "pr_details": None,
+                "fetch_error": result["error"],
+                "messages": [AIMessage(content=f"[fetch_agent] Failed to fetch PR: {result['error']}")],
+            }
+
+        llm = _llm(temperature=0.2)
+        record_llm_call("fetch_agent")
+        response = llm.invoke(
+            [
+                SystemMessage(content=FETCH_AGENT_PROMPT),
+                HumanMessage(content=json.dumps(result, indent=2)),
+            ],
+            config=config,
+        )
+
         return {
-            "pr_details": None,
-            "fetch_error": result["error"],
-            "messages": [AIMessage(content=f"[fetch_agent] Failed to fetch PR: {result['error']}")],
+            "pr_details": result,
+            "fetch_error": None,
+            "messages": [AIMessage(content=f"[fetch_agent] {response.content}")],
         }
-
-    llm = _llm(temperature=0.2)
-    response = llm.invoke([
-        SystemMessage(content=FETCH_AGENT_PROMPT),
-        HumanMessage(content=json.dumps(result, indent=2)),
-    ])
-
-    return {
-        "pr_details": result,
-        "fetch_error": None,
-        "messages": [AIMessage(content=f"[fetch_agent] {response.content}")],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -93,39 +107,50 @@ Respond ONLY as JSON with this exact shape, no prose outside the JSON:
 {"risk_level": "LOW|MEDIUM|HIGH", "reasoning": "2-3 sentence explanation"}"""
 
 
-def risk_agent(state: PRAgentState) -> dict:
+def risk_agent(state: PRAgentState, config: RunnableConfig) -> dict:
     """Agent 2: runs the heuristic, then asks the LLM to make the final call."""
-    if state.get("fetch_error"):
+    repo, pr_number = state["repo"], state["pr_number"]
+
+    with observe_agent("risk_agent", repo=repo, pr_number=pr_number):
+        if state.get("fetch_error"):
+            record_risk_level("UNKNOWN")
+            return {
+                "risk_level": "UNKNOWN",
+                "risk_reasoning": "Skipped — PR details were not available.",
+                "messages": [AIMessage(content="[risk_agent] Skipped risk analysis: no PR details.")],
+            }
+
+        pr_details = state["pr_details"]
+        heuristic = run_risk_heuristic(pr_details)
+        log.info("risk_heuristic_computed", repo=repo, pr_number=pr_number, **heuristic)
+
+        llm = _llm(temperature=0.2)
+        payload = {"pr_details": pr_details, "heuristic_signal": heuristic}
+        record_llm_call("risk_agent")
+        response = llm.invoke(
+            [
+                SystemMessage(content=RISK_AGENT_PROMPT),
+                HumanMessage(content=json.dumps(payload, indent=2)),
+            ],
+            config=config,
+        )
+
+        risk_level, reasoning = heuristic["heuristic_level"], response.content
+        try:
+            parsed = json.loads(response.content)
+            risk_level = str(parsed.get("risk_level", risk_level)).upper()
+            reasoning = parsed.get("reasoning", reasoning)
+        except (json.JSONDecodeError, AttributeError):
+            # LLM didn't return clean JSON — fall back to the deterministic heuristic
+            log.warning("risk_agent_json_parse_failed", repo=repo, pr_number=pr_number)
+
+        record_risk_level(risk_level)
+
         return {
-            "risk_level": "UNKNOWN",
-            "risk_reasoning": "Skipped — PR details were not available.",
-            "messages": [AIMessage(content="[risk_agent] Skipped risk analysis: no PR details.")],
+            "risk_level": risk_level,
+            "risk_reasoning": reasoning,
+            "messages": [AIMessage(content=f"[risk_agent] Risk level: {risk_level}. {reasoning}")],
         }
-
-    pr_details = state["pr_details"]
-    heuristic = run_risk_heuristic(pr_details)
-
-    llm = _llm(temperature=0.2)
-    payload = {"pr_details": pr_details, "heuristic_signal": heuristic}
-    response = llm.invoke([
-        SystemMessage(content=RISK_AGENT_PROMPT),
-        HumanMessage(content=json.dumps(payload, indent=2)),
-    ])
-
-    risk_level, reasoning = heuristic["heuristic_level"], response.content
-    try:
-        parsed = json.loads(response.content)
-        risk_level = str(parsed.get("risk_level", risk_level)).upper()
-        reasoning = parsed.get("reasoning", reasoning)
-    except (json.JSONDecodeError, AttributeError):
-        # LLM didn't return clean JSON — fall back to the deterministic heuristic
-        pass
-
-    return {
-        "risk_level": risk_level,
-        "risk_reasoning": reasoning,
-        "messages": [AIMessage(content=f"[risk_agent] Risk level: {risk_level}. {reasoning}")],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -142,52 +167,62 @@ Respond ONLY as JSON with this exact shape, no prose outside the JSON:
 {"subject": "...", "body": "..."}"""
 
 
-def email_agent(state: PRAgentState) -> dict:
+def email_agent(state: PRAgentState, config: RunnableConfig) -> dict:
     """Agent 3: drafts and sends the notification email."""
-    admin_email = state.get("admin_email") or os.getenv("ADMIN_EMAIL")
-    if not admin_email:
+    repo, pr_number = state["repo"], state["pr_number"]
+
+    with observe_agent("email_agent", repo=repo, pr_number=pr_number):
+        admin_email = state.get("admin_email") or os.getenv("ADMIN_EMAIL")
+        if not admin_email:
+            record_email_result(False)
+            return {
+                "email_sent": False,
+                "email_error": "No admin_email provided in state or ADMIN_EMAIL env var.",
+                "messages": [AIMessage(content="[email_agent] Skipped: no recipient email configured.")],
+            }
+
+        context = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "pr_url": state.get("pr_url"),
+            "pr_details": state.get("pr_details"),
+            "fetch_error": state.get("fetch_error"),
+            "risk_level": state.get("risk_level"),
+            "risk_reasoning": state.get("risk_reasoning"),
+        }
+
+        llm = _llm(temperature=0.4)
+        record_llm_call("email_agent")
+        response = llm.invoke(
+            [
+                SystemMessage(content=EMAIL_AGENT_PROMPT),
+                HumanMessage(content=json.dumps(context, indent=2)),
+            ],
+            config=config,
+        )
+
+        subject = f"PR #{pr_number} review — risk: {state.get('risk_level', 'UNKNOWN')}"
+        body = response.content
+        try:
+            parsed = json.loads(response.content)
+            subject = parsed.get("subject", subject)
+            body = parsed.get("body", body)
+        except (json.JSONDecodeError, AttributeError):
+            log.warning("email_agent_json_parse_failed", repo=repo, pr_number=pr_number)
+
+        result = send_email(admin_email, subject, body)
+        record_email_result(bool(result.get("success")))
+
+        if result.get("success"):
+            return {
+                "email_sent": True,
+                "email_error": None,
+                "messages": [AIMessage(content=f"[email_agent] Email sent to {admin_email}.")],
+            }
+
+        log.error("email_send_failed", repo=repo, pr_number=pr_number, error=result.get("error"))
         return {
             "email_sent": False,
-            "email_error": "No admin_email provided in state or ADMIN_EMAIL env var.",
-            "messages": [AIMessage(content="[email_agent] Skipped: no recipient email configured.")],
+            "email_error": result.get("error"),
+            "messages": [AIMessage(content=f"[email_agent] Failed to send email: {result.get('error')}")],
         }
-
-    context = {
-        "repo": state["repo"],
-        "pr_number": state["pr_number"],
-        "pr_url": state.get("pr_url"),
-        "pr_details": state.get("pr_details"),
-        "fetch_error": state.get("fetch_error"),
-        "risk_level": state.get("risk_level"),
-        "risk_reasoning": state.get("risk_reasoning"),
-    }
-
-    llm = _llm(temperature=0.4)
-    response = llm.invoke([
-        SystemMessage(content=EMAIL_AGENT_PROMPT),
-        HumanMessage(content=json.dumps(context, indent=2)),
-    ])
-
-    subject = f"PR #{state['pr_number']} review — risk: {state.get('risk_level', 'UNKNOWN')}"
-    body = response.content
-    try:
-        parsed = json.loads(response.content)
-        subject = parsed.get("subject", subject)
-        body = parsed.get("body", body)
-    except (json.JSONDecodeError, AttributeError):
-        pass  # fall back to the raw LLM text as the body
-
-    result = send_email(admin_email, subject, body)
-
-    if result.get("success"):
-        return {
-            "email_sent": True,
-            "email_error": None,
-            "messages": [AIMessage(content=f"[email_agent] Email sent to {admin_email}.")],
-        }
-
-    return {
-        "email_sent": False,
-        "email_error": result.get("error"),
-        "messages": [AIMessage(content=f"[email_agent] Failed to send email: {result.get('error')}")],
-    }

@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: "pr-agent"
+    static_configs:
+      # main.py exposes /metrics on :8000 via observability.start_metrics_server()
+      - targets: ["host.docker.internal:8000"]
